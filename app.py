@@ -12,24 +12,22 @@ st.set_page_config(
     page_title="SIP Knowledge Assistant",
     page_icon="🎓",
     layout="centered",
-    initial_sidebar_state="collapsed",
 )
 
-DATABASE_FILE = "SIP_FAQ_Bot_Database_Complete.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+DATABASE_FILE = BASE_DIR / "SIP_FAQ_Bot_Database_Complete.xlsx"
+
 SIMILARITY_THRESHOLD = 0.12
 
 
 def clean_text(text):
     text = str(text).lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 @st.cache_data
-def load_faq_database(file_name):
-    file_path = Path(file_name)
-
+def load_faq_database(file_path):
     if not file_path.exists():
         return None
 
@@ -74,13 +72,11 @@ def keyword_overlap_score(user_text, keyword_text):
     if not user_words or not keyword_words:
         return 0.0
 
-    shared_words = user_words.intersection(keyword_words)
-    return len(shared_words) / len(user_words)
+    return len(user_words.intersection(keyword_words)) / len(user_words)
 
 
 def find_best_faq(user_question, faq_database):
     cleaned_question = clean_text(user_question)
-
     searchable_text = faq_database["Search_Text"].apply(clean_text).tolist()
 
     vectorizer = TfidfVectorizer(
@@ -97,18 +93,17 @@ def find_best_faq(user_question, faq_database):
     ).flatten()
 
     keyword_scores = faq_database["Keywords"].apply(
-        lambda keywords: keyword_overlap_score(cleaned_question, keywords)
+        lambda value: keyword_overlap_score(cleaned_question, value)
     ).to_numpy()
 
     combined_scores = (similarity_scores * 0.75) + (keyword_scores * 0.25)
 
     best_index = combined_scores.argmax()
-    best_score = combined_scores[best_index]
 
-    return faq_database.iloc[best_index], best_score
+    return faq_database.iloc[best_index], combined_scores[best_index]
 
 
-def format_answer(faq_record):
+def create_answer(faq_record):
     answer = str(faq_record["Proposed_Answer"]).strip()
     faq_id = str(faq_record["FAQ_ID"]).strip()
     source = str(faq_record["Relevant_Policy_or_Source"]).strip()
@@ -139,18 +134,16 @@ def generate_response(user_question, faq_database):
             "**Learning Officer (LO)** for clarification."
         )
 
-    return format_answer(faq_record)
+    return create_answer(faq_record)
 
 
-def response_stream(text):
-    words = text.split(" ")
-
-    for word in words:
+def type_response(text):
+    for word in text.split(" "):
         yield word + " "
         time.sleep(0.018)
 
 
-def clear_chat():
+def reset_chat():
     st.session_state.messages = [
         {
             "role": "assistant",
@@ -168,34 +161,32 @@ faq_database = load_faq_database(DATABASE_FILE)
 
 st.title("🎓 SIP Knowledge Assistant")
 st.caption(
-    "Your AI-style guide for frequently asked Student Internship Programme questions."
+    "Ask SIP questions naturally. I will search the approved FAQ database."
 )
 
 if faq_database is None:
     st.error(
-        f"I cannot find `{DATABASE_FILE}`. "
-        "Please upload it to the same GitHub folder as `app.py`."
+        "The FAQ Excel file could not be found. "
+        "Make sure `SIP_FAQ_Bot_Database_Complete.xlsx` is uploaded beside `app.py`."
     )
     st.stop()
 
 if "messages" not in st.session_state:
-    clear_chat()
+    reset_chat()
 
 with st.sidebar:
-    st.subheader("Chat controls")
-
     if st.button("🗑️ Clear chat"):
-        clear_chat()
+        reset_chat()
         st.rerun()
 
-    st.caption(f"Knowledge base: {len(faq_database)} published SIP FAQ records")
+    st.caption(f"Loaded {len(faq_database)} published FAQ records.")
 
     with st.expander("Example questions"):
         st.write(
-            "- I am sick. Where should I send my MC?\n"
+            "- I am sick. Where do I submit my MC?\n"
+            "- I may be late because of traffic.\n"
             "- Can I work from home during SIP?\n"
-            "- I might be late because of traffic.\n"
-            "- What if I get injured at work?\n"
+            "- What happens if I get injured at work?\n"
             "- How long is SIP?"
         )
 
@@ -203,9 +194,7 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-user_question = st.chat_input(
-    "Ask a question about SIP...",
-)
+user_question = st.chat_input("Ask a question about SIP...")
 
 if user_question:
     st.session_state.messages.append(
@@ -220,16 +209,16 @@ if user_question:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            answer = generate_response(user_question, faq_database)
+            response = generate_response(user_question, faq_database)
 
-        streamed_answer = st.write_stream(
-            response_stream(answer),
+        completed_response = st.write_stream(
+            type_response(response),
             cursor="▌",
         )
 
     st.session_state.messages.append(
         {
             "role": "assistant",
-            "content": streamed_answer,
+            "content": completed_response,
         }
     )
