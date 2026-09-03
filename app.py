@@ -11,11 +11,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 st.set_page_config(
     page_title="SIP Knowledge Assistant",
     page_icon="🎓",
-    layout="centered",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_FILE = BASE_DIR / "SIP_FAQ_Bot_Database_Complete.xlsx"
+DATABASE_PATH = BASE_DIR / "SIP_FAQ_Bot_Database_Complete.xlsx"
 
 SIMILARITY_THRESHOLD = 0.12
 
@@ -26,8 +27,10 @@ def clean_text(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-@st.cache_data
-def load_faq_database(file_path):
+@st.cache_data(show_spinner=False)
+def load_faq_database(file_path_string, file_modified_time):
+    file_path = Path(file_path_string)
+
     if not file_path.exists():
         return None
 
@@ -50,8 +53,11 @@ def load_faq_database(file_path):
             dataframe[column] = ""
 
     dataframe = dataframe[
-        dataframe["Record_Status"].astype(str).str.strip().str.lower()
-        == "published"
+        dataframe["Record_Status"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("published")
     ].copy()
 
     dataframe["Search_Text"] = (
@@ -65,19 +71,20 @@ def load_faq_database(file_path):
     return dataframe
 
 
-def keyword_overlap_score(user_text, keyword_text):
-    user_words = set(clean_text(user_text).split())
-    keyword_words = set(clean_text(keyword_text).split())
+def keyword_overlap_score(user_question, keywords):
+    user_words = set(clean_text(user_question).split())
+    keyword_words = set(clean_text(keywords).split())
 
     if not user_words or not keyword_words:
         return 0.0
 
-    return len(user_words.intersection(keyword_words)) / len(user_words)
+    shared_words = user_words.intersection(keyword_words)
+    return len(shared_words) / len(user_words)
 
 
 def find_best_faq(user_question, faq_database):
     cleaned_question = clean_text(user_question)
-    searchable_text = faq_database["Search_Text"].apply(clean_text).tolist()
+    searchable_texts = faq_database["Search_Text"].apply(clean_text).tolist()
 
     vectorizer = TfidfVectorizer(
         stop_words="english",
@@ -85,7 +92,7 @@ def find_best_faq(user_question, faq_database):
         sublinear_tf=True,
     )
 
-    vectors = vectorizer.fit_transform(searchable_text + [cleaned_question])
+    vectors = vectorizer.fit_transform(searchable_texts + [cleaned_question])
 
     similarity_scores = cosine_similarity(
         vectors[-1],
@@ -93,114 +100,248 @@ def find_best_faq(user_question, faq_database):
     ).flatten()
 
     keyword_scores = faq_database["Keywords"].apply(
-        lambda value: keyword_overlap_score(cleaned_question, value)
+        lambda keywords: keyword_overlap_score(cleaned_question, keywords)
     ).to_numpy()
 
     combined_scores = (similarity_scores * 0.75) + (keyword_scores * 0.25)
 
     best_index = combined_scores.argmax()
 
-    return faq_database.iloc[best_index], combined_scores[best_index]
+    return faq_database.iloc[best_index], float(combined_scores[best_index])
 
 
-def create_answer(faq_record):
+def build_bot_reply(faq_record):
     answer = str(faq_record["Proposed_Answer"]).strip()
-    faq_id = str(faq_record["FAQ_ID"]).strip()
-    source = str(faq_record["Relevant_Policy_or_Source"]).strip()
-    source_status = str(faq_record["Source_Status"]).strip()
 
-    response = answer
-
-    if faq_id:
-        response += f"\n\n**Reference:** {faq_id}"
-
-    if source:
-        response += f"\n\n**Source:** {source}"
-
-    if source_status:
-        response += f"\n\n**Source status:** {source_status}"
-
-    return response
-
-
-def generate_response(user_question, faq_database):
-    faq_record, score = find_best_faq(user_question, faq_database)
-
-    if score < SIMILARITY_THRESHOLD:
-        return (
-            "I’m sorry, but I could not find a reliable answer for that in the "
-            "current SIP FAQ database.\n\n"
-            "Please check the latest information on **SIP Teams** or contact your "
-            "**Learning Officer (LO)** for clarification."
+    if not answer:
+        answer = (
+            "I found a related FAQ record, but its answer is incomplete. "
+            "Please check SIP Teams or contact your Learning Officer (LO)."
         )
 
-    return create_answer(faq_record)
+    return answer
 
 
-def type_response(text):
+def stream_reply(text):
     for word in text.split(" "):
         yield word + " "
-        time.sleep(0.018)
+        time.sleep(0.016)
 
 
-def reset_chat():
+def initialise_chat():
     st.session_state.messages = [
         {
             "role": "assistant",
             "content": (
-                "Hi! I’m your SIP Knowledge Assistant. 👋\n\n"
-                "Ask me about MC submission, attendance, learning journals, "
-                "workplace concerns, dress code, injuries, overtime, schedules, "
-                "or other SIP-related matters."
+                "Hello! I’m your **SIP Knowledge Assistant**. 👋\n\n"
+                "Ask me naturally about your Student Internship Programme—"
+                "for example, MC submission, attendance, learning journals, "
+                "workplace issues, overtime, injuries, dress code, or the SIP duration."
             ),
+            "metadata": None,
         }
     ]
 
 
-faq_database = load_faq_database(DATABASE_FILE)
+def refresh_database():
+    load_faq_database.clear()
+    st.session_state.database_refresh_notice = True
 
-st.title("🎓 SIP Knowledge Assistant")
-st.caption(
-    "Ask SIP questions naturally. I will search the approved FAQ database."
+
+def clear_chat():
+    initialise_chat()
+
+
+def ask_quick_question(question):
+    st.session_state.pending_question = question
+
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1120px;
+            padding-top: 2rem;
+            padding-bottom: 2rem;
+        }
+
+        .app-header {
+            background: linear-gradient(135deg, #0b3d91 0%, #1463d8 100%);
+            padding: 1.5rem 1.7rem;
+            border-radius: 18px;
+            color: white;
+            margin-bottom: 1.25rem;
+            box-shadow: 0 8px 20px rgba(11, 61, 145, 0.18);
+        }
+
+        .app-header h1 {
+            color: white;
+            margin: 0;
+            font-size: 2rem;
+        }
+
+        .app-header p {
+            margin: 0.45rem 0 0 0;
+            opacity: 0.94;
+            font-size: 1rem;
+        }
+
+        .info-card {
+            background: #f5f8ff;
+            border: 1px solid #dbe7ff;
+            border-radius: 14px;
+            padding: 1rem 1.1rem;
+            margin-bottom: 1rem;
+        }
+
+        .small-note {
+            color: #5b6472;
+            font-size: 0.88rem;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-if faq_database is None:
+st.markdown(
+    """
+    <div class="app-header">
+        <h1>🎓 SIP Knowledge Assistant</h1>
+        <p>A conversational guide for Student Internship Programme FAQs.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+if not DATABASE_PATH.exists():
     st.error(
-        "The FAQ Excel file could not be found. "
-        "Make sure `SIP_FAQ_Bot_Database_Complete.xlsx` is uploaded beside `app.py`."
+        "I cannot locate the FAQ database file. Confirm that "
+        "`SIP_FAQ_Bot_Database_Complete.xlsx` is in the same GitHub folder as `app.py`."
+    )
+    st.stop()
+
+database_modified_time = DATABASE_PATH.stat().st_mtime
+faq_database = load_faq_database(
+    str(DATABASE_PATH),
+    database_modified_time,
+)
+
+if faq_database is None or faq_database.empty:
+    st.error(
+        "The FAQ database could not be loaded, or it contains no rows marked `Published`."
     )
     st.stop()
 
 if "messages" not in st.session_state:
-    reset_chat()
+    initialise_chat()
+
+if "pending_question" not in st.session_state:
+    st.session_state.pending_question = None
+
+if "database_refresh_notice" not in st.session_state:
+    st.session_state.database_refresh_notice = False
 
 with st.sidebar:
-    if st.button("🗑️ Clear chat"):
-        reset_chat()
+    st.subheader("Assistant controls")
+
+    if st.button("🔄 Refresh knowledge base", use_container_width=True):
+        refresh_database()
         st.rerun()
 
-    st.caption(f"Loaded {len(faq_database)} published FAQ records.")
+    if st.button("🗑️ Clear conversation", use_container_width=True):
+        clear_chat()
+        st.rerun()
 
-    with st.expander("Example questions"):
-        st.write(
-            "- I am sick. Where do I submit my MC?\n"
-            "- I may be late because of traffic.\n"
-            "- Can I work from home during SIP?\n"
-            "- What happens if I get injured at work?\n"
-            "- How long is SIP?"
-        )
+    st.divider()
+
+    st.metric(
+        label="Published FAQ records",
+        value=len(faq_database),
+    )
+
+    st.caption("Database file")
+    st.code("SIP_FAQ_Bot_Database_Complete.xlsx", language=None)
+
+    st.caption(
+        "Use **Refresh knowledge base** after uploading or replacing the Excel file in GitHub."
+    )
+
+    st.divider()
+
+    st.subheader("Coverage")
+    st.caption(
+        "MCs • schedules • journals • attendance • workplace conduct • "
+        "injuries • overtime • social media • SIP duration"
+    )
+
+if st.session_state.database_refresh_notice:
+    st.success(
+        "Knowledge base refreshed. The assistant is now using the latest Excel file."
+    )
+    st.session_state.database_refresh_notice = False
+
+st.markdown(
+    """
+    <div class="info-card">
+        <strong>Ask freely.</strong> You do not need to use the exact wording from the FAQ.
+        Try: “How many weeks is my internship?”, “Where do I send my doctor note?”,
+        or “I might be late because of traffic.”
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.caption("Quick questions")
+
+quick_col_1, quick_col_2, quick_col_3, quick_col_4 = st.columns(4)
+
+with quick_col_1:
+    if st.button("How do I submit my MC?", use_container_width=True):
+        ask_quick_question("How do I submit my MC?")
+
+with quick_col_2:
+    if st.button("What if I am late?", use_container_width=True):
+        ask_quick_question("What should I do if I am late for work?")
+
+with quick_col_3:
+    if st.button("How long is SIP?", use_container_width=True):
+        ask_quick_question("How long is SIP?")
+
+with quick_col_4:
+    if st.button("What if I get injured?", use_container_width=True):
+        ask_quick_question("What should I do if I get injured at work?")
+
+st.divider()
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-user_question = st.chat_input("Ask a question about SIP...")
+        if message.get("metadata"):
+            metadata = message["metadata"]
+
+            with st.expander("Reference details"):
+                st.write(f"**FAQ ID:** {metadata['faq_id']}")
+                st.write(f"**Source:** {metadata['source']}")
+                st.write(f"**Source status:** {metadata['source_status']}")
+                st.write(
+                    f"**Match confidence:** {metadata['confidence']:.0%}"
+                )
+
+user_question = st.chat_input(
+    "Ask a question about SIP...",
+)
+
+if st.session_state.pending_question:
+    user_question = st.session_state.pending_question
+    st.session_state.pending_question = None
 
 if user_question:
     st.session_state.messages.append(
         {
             "role": "user",
             "content": user_question,
+            "metadata": None,
         }
     )
 
@@ -208,17 +349,60 @@ if user_question:
         st.markdown(user_question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            response = generate_response(user_question, faq_database)
+        with st.spinner("Checking the SIP knowledge base..."):
+            best_faq, confidence_score = find_best_faq(
+                user_question,
+                faq_database,
+            )
 
-        completed_response = st.write_stream(
-            type_response(response),
+        if confidence_score < SIMILARITY_THRESHOLD:
+            reply = (
+                "I’m sorry, but I could not find a reliable answer for that in the "
+                "current SIP FAQ database.\n\n"
+                "Please check **SIP Teams** or contact your **Learning Officer (LO)** "
+                "for clarification."
+            )
+            metadata = None
+        else:
+            reply = build_bot_reply(best_faq)
+            metadata = {
+                "faq_id": str(best_faq["FAQ_ID"]).strip(),
+                "source": str(
+                    best_faq["Relevant_Policy_or_Source"]
+                ).strip(),
+                "source_status": str(best_faq["Source_Status"]).strip(),
+                "confidence": confidence_score,
+            }
+
+        completed_reply = st.write_stream(
+            stream_reply(reply),
             cursor="▌",
         )
+
+        if metadata:
+            with st.expander("Reference details"):
+                st.write(f"**FAQ ID:** {metadata['faq_id']}")
+                st.write(f"**Source:** {metadata['source']}")
+                st.write(f"**Source status:** {metadata['source_status']}")
+                st.write(
+                    f"**Match confidence:** {metadata['confidence']:.0%}"
+                )
 
     st.session_state.messages.append(
         {
             "role": "assistant",
-            "content": completed_response,
+            "content": completed_reply,
+            "metadata": metadata,
         }
     )
+
+st.markdown(
+    """
+    <p class="small-note">
+        This assistant provides answers from the uploaded SIP FAQ database.
+        For matters requiring confirmation, consult the latest SIP Teams updates
+        or your Learning Officer.
+    </p>
+    """,
+    unsafe_allow_html=True,
+)
